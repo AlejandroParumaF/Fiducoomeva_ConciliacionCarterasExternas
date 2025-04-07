@@ -1,0 +1,22 @@
+Genera una nueva clave:
+
+	ssh-keygen -t ed25519 -C "tu_email@example.com"
+
+	eval "$(ssh-agent -s)"  # Inicia el agente SSH
+	ssh-add ~/.ssh/id_ed25519  # Añade tu clave privada
+
+
+Guardar en GitHub:
+
+	Copia tu clave pública: cat ~/.ssh/id_ed25519.pub
+
+	Ve a GitHub → Settings → SSH and GPG keys:
+
+	Haz clic en New SSH key.
+
+	Pega la clave y guarda.
+
+
+Verifica la conexión con GitHub:
+
+	ssh -T git@github.com

@@ -10,6 +10,7 @@ import shutil
 import easyocr
 import ssl
 from pathlib import Path
+import warnings
 
 class Periodo(object):
     def __init__(self, id):
@@ -53,6 +54,7 @@ class Negocio(object):
 class Controller(object):
 
     def __init__(self):
+        warnings.simplefilter(action='ignore', category=UserWarning)
         self.folder_path = self.find_path('BOT CONCILIACION CARTERA EXTERNA')
         self.read_config()
         self.data_manager = DataManager()
@@ -330,6 +332,17 @@ class Controller(object):
                 return self.convert_to_float(match[0].replace(' ',''))
         except:
             return 'ERROR'
+        
+    def process_numeric_line_ocr(self, line):
+        try:
+            line = line.replace("o", "0").replace("O", "0").replace("l", "1").replace("L", "1")
+            line = line.replace("I", "1").replace("i", "1").replace("S", "5").replace("s", "5")
+            rex = r"(\d+.*\d+)"
+            match = re.search(rex, line)
+            if match:
+                return self.convert_to_float(match[0].replace(' ',''))
+        except:
+            return 'ERROR'
 
     def read_model1(self, page):
         data = []
@@ -428,24 +441,24 @@ class Controller(object):
                 periodo = page[x+1]
                 periodo = self.process_period(periodo)
             elif 'APORTES' in line.upper() and aporte == 'ERROR':
-                aporte = page[x+1][1:]
-                aporte = self.process_numeric_line(aporte)
+                aporte = page[x+1].split(' ')[-1]
+                aporte = self.process_numeric_line_ocr(aporte)
 
             elif 'RETIROS' in line.upper() and retiro == 'ERROR':
-                retiro = page[x+1][1:]
-                retiro = self.process_numeric_line(retiro)
+                retiro = page[x+1].split(' ')[-1]
+                retiro = self.process_numeric_line_ocr(retiro)
 
-            elif 'RETENCIÓN EN LA FUENTE' in line.upper() and retefuente == 'ERROR':
-                retefuente = page[x+1][1:]
-                retefuente = self.process_numeric_line(retefuente)
+            elif retefuente == 'ERROR' and any(phrase in line.upper() for phrase in ["RETENCIÓN EN LA FUENTE", "RETENCION EN LA FUENTE", "RELENCION EN LA FUENTE"]):
+                retefuente = page[x+1].split(' ')[-1]
+                retefuente = self.process_numeric_line_ocr(retefuente)
 
-            elif 'RENDIMIENTOS NETOS' in line.upper() and rend == 'ERROR':
-                rend = page[x+1][1:]
-                rend = self.process_numeric_line(rend)
+            elif rend == 'ERROR' and any(phrase in line.upper() for phrase in ["RENDIMIENTOS NETOS", "RENDIMIENLOS NETOS"]):
+                rend = page[x+1].split(' ')[-1]
+                rend = self.process_numeric_line_ocr(rend)
 
             elif 'SALDO FINAL' in line.upper() and saldo_final == 'ERROR':
-                saldo_final = page[x+1][1:]
-                saldo_final = self.process_numeric_line(saldo_final)
+                saldo_final = page[x+1].split(' ')[-1]
+                saldo_final = self.process_numeric_line_ocr(saldo_final)
 
                
         return [periodo, aporte, retiro, retefuente, rend, saldo_final]
@@ -482,19 +495,18 @@ class Controller(object):
         base_path = join(self.folder_path, 'Lista Extractos')
         pos = 0
         ssl._create_default_https_context = ssl._create_stdlib_context
-        reader = easyocr.Reader(['es'])
+        reader = easyocr.Reader(['es'], gpu=False)
 
         while pos < len(pdf_list):
             try:
-                path = self.pdf_to_images(pdf_list[pos+1], pdf_list[pos])
-                result = reader.readtext(path, detail=0)
-                print(result)
+                path = self.pdf_to_images(pdf_list[pos+1], pdf_list[pos], 2000)
+                result = reader.readtext(path, detail=0, paragraph=False)
                 data = self.read_model_ocr(result)
+                print(data)
                 if 'ERROR' in data:
                     self.file_not_read(base_path, pdf_list[pos+1])
                     continue
                 else:
-                    print(data)
                     pdf_list[pos].update_periodo_extracto(data)
                     print(f'Se leyó correctamente el archivo: {pdf_list[pos+1]}')
                 
@@ -503,20 +515,19 @@ class Controller(object):
                 continue
             finally:
                 pos+=2
-                remove(path)
             
-    def pdf_to_images(self, doc, cias):
+    def pdf_to_images(self, doc, cias, dpi):
         pdf = fitz.Document(join(join(self.folder_path, 'Lista Extractos'), doc))
         if pdf.needs_pass:
-            pdf.authenticate(str(cias.nit))                     
-    
-        val = join(join(self.folder_path, 'Lista Extractos'), f"image_{doc}.png")
+            pdf.authenticate(str(cias.nit)) 
+                
         page = pdf[-1]
-        zoom = 4
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        pix.save(val)
-        pdf.close()
+
+        zoom = dpi / 72  # El DPI base de PDF suele ser 72
+        matriz = fitz.Matrix(zoom, zoom)
+        pixmap = page.get_pixmap(matrix=matriz, alpha=False) # alpha=False para ignorar transparencia
+
+        val = pixmap.tobytes("png") # 
         return val
 
     def file_not_read(self, base_path, doc):

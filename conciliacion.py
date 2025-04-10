@@ -6,6 +6,7 @@ from pathlib import Path
 import pymupdf as fitz
 import re
 from pymupdf4llm.helpers.get_text_lines import get_text_lines
+import easyocr
 
 class BotConciliacion:
     def __init__(self, root):
@@ -195,10 +196,9 @@ class BotConciliacion:
             
             self.df_retfte = self.leer_datos_rtef()
             self.df_database = self.leer_datos_database()
-            self.leer_datos_extractos()
+            self.df_extractos = self.leer_datos_extractos()
 
-            print(self.df_retfte)
-            print(self.df_database)
+            self.generar_conciliacion(self.df_retfte, self.df_database, self.df_extractos)
 
     def consultar_nit(self, codigo):
         nit = self.df_database.loc[self.df_database['CÓDIGO'] == codigo, 'NIT PA']
@@ -208,15 +208,51 @@ class BotConciliacion:
             messagebox.showerror("Error", f"NIT no encontrado para el código {codigo}")
             return None
 
+    def generar_conciliacion(self, df_retfte, df_database, df_extractos):
+
+        df_retfte['CÓDIGO'] = df_retfte['CÓDIGO'].astype(float)
+        df_database['CÓDIGO'] = df_database['CÓDIGO'].astype(float)
+        df_extractos['CÓDIGO'] = df_extractos['CÓDIGO'].astype(float)
+        print(df_retfte)
+        print(df_database)
+        print(df_extractos)
+
+        df1 = pd.merge(df_database, df_retfte, on='CÓDIGO', how='left')
+
+        df2 = pd.merge(df1, df_extractos, on='CÓDIGO', how='left')
+
+        df2['APORTES SIFI'] = df2['APORTES SIFI'].fillna(0)
+        df2['RETIROS SIFI'] = df2['RETIROS SIFI'].fillna(0)
+
+        df2['NIT PA'] = df2['NIT PA'].astype(int)
+        df2['PERIODO'] = df2['PERIODO'].astype(int)
+        df2['TERCERO'] = df2['TERCERO'].astype(int)
+
+        df2['DIFERENCIA'] = df2['SALDO EXTRACTO'] - df2['SALDO CONTABLE']
+        df2['APORTE PENDIENTE'] = df2['APORTES'] - df2['APORTES SIFI']
+        df2['RETIROS PENDIENTES'] = df2['RETIROS'] - df2['RETIROS SIFI']
+        df2['RETENCIONES NO PROCEDENTES'] = df2['RETENCIÓN EN LA FUENTE'] + df2['RETENCIONES NO PROCEDENTES']
+        df2['AJUSTE EN RENDIMIENTOS'] = df2['DIFERENCIA'] - (df2['APORTE PENDIENTE'] - df2['RETIROS PENDIENTES'] -df2['RETENCIONES NO PROCEDENTES'])
+
+        df2['RENDIMIENTO EN CONTRA'] = df2['AJUSTE EN RENDIMIENTOS'].apply(lambda valor: valor if valor < 0 else 0)
+        df2['RENDIMIENTO A FAVOR'] = df2['AJUSTE EN RENDIMIENTOS'].apply(lambda valor: valor if valor > 0 else 0)
+
+        df2.drop(columns=['APORTES SIFI', 'RETIROS SIFI', 'PERIODO', 'APORTES', 'RETIROS', 'RETENCIÓN EN LA FUENTE', 'RENDIMIENTOS NETOS'], inplace=True)
+
+        df2 = df2[['NIT PA', 'CÓDIGO', 'NOMBRE ENCARGO', 'PATRIMONIO AUTÓNOMO', 'TERCERO', 'SALDO CONTABLE', 'SALDO EXTRACTO', 'DIFERENCIA', 'APORTE PENDIENTE', 'RETIROS PENDIENTES', 'RETENCIONES NO PROCEDENTES', 'AJUSTE EN RENDIMIENTOS', 'RENDIMIENTO EN CONTRA', 'RENDIMIENTO A FAVOR']]
+        df2.to_excel('Conciliacion.xlsx', index=False)
+    
     def leer_datos_rtef(self):
         df_retfte = pd.read_excel(self.entrada_archivo.get())
 
         try:
             df_retfte = df_retfte[['Codigo PA', 'TOTAL']]
+            df_retfte['TOTAL'] = df_retfte['TOTAL'].astype(float)
             df_retfte = df_retfte.rename(columns={'Codigo PA': 'CÓDIGO', 'TOTAL': 'RETENCIONES NO PROCEDENTES'})
+            
             return df_retfte
-        except KeyError:
-            messagebox.showerror("Error", "El archivo Datos Dev Retefte no contiene las columnas Código PA y/o TOTAL")
+        except KeyError as e:
+            messagebox.showerror("Error", f"El archivo Datos Dev Retefte no contiene las columnas Código PA y/o TOTAL {e}")
             return None
         except Exception as e:
             messagebox.showerror("Error", f"Error al leer el archivo: {e}")
@@ -256,13 +292,56 @@ class BotConciliacion:
                     AND SALD_FECMOV = :2
                     AND SALD_CIAS IN ({in_clause_placeholders}) -- Aquí se inserta :3, :4, ...
             '''    
+        
+        sql2 = f'''
+            SELECT CÓDIGO, COALESCE(APORTES, 0) AS "APORTES SIFI", COALESCE(RETIROS, 0) AS "RETIROS SIFI" FROM(
+                SELECT NEGOCIO AS "CÓDIGO", SUM(VALOR) AS VALOR, TIPO from(
+                    SELECT
+                        ge_tcias.cias_cias NEGOCIO,
+                        sc_tmvco.mvco_mtoren VALOR,
+                        CASE
+                            WHEN mvco_descri LIKE '% 241' THEN 'AP'
+                            WHEN mvco_descri LIKE '% 240' THEN 'AP'
+                            WHEN mvco_descri LIKE '%ORDEN DE INVERSIÓN %' THEN 'AP'
+                            WHEN mvco_descri LIKE '% 242' THEN 'RE'
+                            WHEN mvco_te_tpmv = 34 THEN 'RE'
+                        ELSE 'NA'
+                        END AS TIPO
+                    FROM
+                        vu_sfi.sc_tmvco sc_tmvco
+                        LEFT JOIN ge_tauxil ON sc_tmvco.mvco_auxi = ge_tauxil.auxi_auxi
+                        LEFT JOIN ge_tcias ON sc_tmvco.mvco_cias = ge_tcias.cias_cias     
+                        JOIN sc_tctco 
+                        ON sc_tmvco.mvco_fecmov = sc_tctco.ctco_fecmov 
+                        AND sc_tmvco.mvco_tpco = sc_tctco.ctco_tpco 
+                        AND sc_tmvco.mvco_nrocom = sc_tctco.ctco_nrocom
+                        AND ge_tcias.cias_cias = sc_tctco.CTCO_CIAS
+                    WHERE
+                        sc_tmvco.mvco_mayo = :1
+                        AND sc_tmvco.mvco_fecmov = :2
+                        AND mvco_cias IN ({in_clause_placeholders})
+                        
+            ) where TIPO IN ('AP','RE')
+
+                GROUP BY
+                NEGOCIO, TIPO)
+                PIVOT (
+                    MAX(ABS(VALOR))
+                    FOR TIPO
+                    IN ('AP' AS APORTES, 'RE' AS RETIROS))
+
+    '''
+        
         params = [cuenta, periodo] + codigos
  
+        
         try:
             con_params = oracledb.ConnectParams(host = config_sifi['host'], port = config_sifi['port'], service_name = config_sifi['service_name'])
 
             with oracledb.connect(user = config_sifi['user'],  password = config_sifi['pwd'], params = con_params) as connection:
-                df = pd.read_sql(sql, connection, params = params)     
+                df1 = pd.read_sql(sql, connection, params = params)
+                df2 = pd.read_sql(sql2, connection, params = params)
+                df = pd.merge(df1, df2, on='CÓDIGO', how='left')    
             return df
         except oracledb.DatabaseError as e:
             error, = e.args
@@ -275,6 +354,7 @@ class BotConciliacion:
             return None
 
     def leer_datos_extractos(self):
+        df_extractos = pd.DataFrame(columns=['CÓDIGO', 'PERIODO', 'APORTES', 'RETIROS', 'RETENCIÓN EN LA FUENTE', 'RENDIMIENTOS NETOS', 'SALDO EXTRACTO'])
         lista_codigos = [str(codigo).strip() for codigo in self.codigos]
         carpeta = Path(self.entrada_carpeta.get())
 
@@ -297,10 +377,12 @@ class BotConciliacion:
                                     print(f"Archivo: {item.name} - Código: {codigo} - Naturaleza: Texto")
                                     datos = self.extraer_datos_pdf_texto(text, pdf)
                                     datos = [codigo, *datos]
-                                    print(datos)
                                 else:
                                     print(f"Archivo: {item.name} - Código: {codigo} - Naturaleza: Escaneado")
-                                    self.extraer_datos_pdf_escaneado(codigo, text)
+                                    datos = self.extraer_datos_pdf_escaneado(pdf, 2000)
+                                    datos = [codigo, *datos]
+                                df_extractos.loc[len(df_extractos)] = datos
+                return df_extractos
             except PermissionError:
                 messagebox.showerror("Error", f"No tienes permisos para leer la carpeta '{self.entrada_carpeta.get()}'.")
                 return None
@@ -400,13 +482,78 @@ class BotConciliacion:
 
         return [periodo, aporte, retiro, retefuente, rend, saldo_final]
     
-    def extraer_datos_pdf_escaneado(self, codigo, texto):
-        print(f"Extrayendo datos del PDF escaneado para el código {codigo}")
+    def extraer_datos_pdf_escaneado(self, pdf, dpi=300, idiomas=['es'], usar_gpu=False):
+        try:
+            reader = easyocr.Reader(idiomas, gpu=usar_gpu)
+
+            zoom = dpi / 72  # El DPI base de PDF suele ser 72
+            matriz = fitz.Matrix(zoom, zoom)
+            pixmap = pdf[-1].get_pixmap(matrix=matriz, alpha=False) 
+            img_bytes = pixmap.tobytes("png")
+
+            resultados = reader.readtext(img_bytes, detail=0, paragraph=False)
+
+            if resultados:
+                datos = self.leer_pdf_ocr(resultados)
+                return datos
+            else:
+                print(f"No se detectó texto en la página.")
+
+        except Exception as e:
+            print(f"Error al procesar el pdf")
+            return None
+        finally:
+            pdf.close()
+
+    def leer_pdf_ocr(self, resultado):
+        periodo = 'ERROR'
+        aporte = 'ERROR'
+        retiro = 'ERROR'
+        rend = 'ERROR'
+        retefuente = 'ERROR'
+        saldo_final = 'ERROR'
+
+        for x, line in enumerate(resultado):
+            if 'PERIODO' in line.upper() and periodo == 'ERROR':
+                periodo = resultado[x+1]
+                periodo = self.process_period(periodo)
+            elif 'APORTES' in line.upper() and aporte == 'ERROR':
+                aporte = resultado[x+1].split(' ')[-1]
+                aporte = self.process_numeric_line_ocr(aporte)
+
+            elif 'RETIROS' in line.upper() and retiro == 'ERROR':
+                retiro = resultado[x+1].split(' ')[-1]
+                retiro = self.process_numeric_line_ocr(retiro)
+
+            elif retefuente == 'ERROR' and any(phrase in line.upper() for phrase in ["RETENCIÓN EN LA FUENTE", "RETENCION EN LA FUENTE", "RELENCION EN LA FUENTE"]):
+                retefuente = resultado[x+1].split(' ')[-1]
+                retefuente = self.process_numeric_line_ocr(retefuente)
+
+            elif rend == 'ERROR' and any(phrase in line.upper() for phrase in ["RENDIMIENTOS NETOS", "RENDIMIENLOS NETOS"]):
+                rend = resultado[x+1].split(' ')[-1]
+                rend = self.process_numeric_line_ocr(rend)
+
+            elif 'SALDO FINAL' in line.upper() and saldo_final == 'ERROR':
+                saldo_final = resultado[x+1].split(' ')[-1]
+                saldo_final = self.process_numeric_line_ocr(saldo_final)
+               
+        return [periodo, aporte, retiro, retefuente, rend, saldo_final]
 
     def process_numeric_line(self, linea):
         try:
             rex = r"(\d+.*\d+)"
             match = re.search(rex, linea)
+            if match:
+                return self.convert_to_float(match[0].replace(' ',''))
+        except:
+            return 'ERROR'
+
+    def process_numeric_line_ocr(self, line):
+        try:
+            line = line.replace("o", "0").replace("O", "0").replace("l", "1").replace("L", "1")
+            line = line.replace("I", "1").replace("i", "1").replace("S", "5").replace("s", "5")
+            rex = r"(\d+.*\d+)"
+            match = re.search(rex, line)
             if match:
                 return self.convert_to_float(match[0].replace(' ',''))
         except:
